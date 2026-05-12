@@ -12,7 +12,7 @@ from aiogram.filters import Command
 from aiogram.client.session.aiohttp import AiohttpSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# Настраиваем логирование, чтобы видеть всё в pm2 logs
+# Настраиваем логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -27,7 +27,6 @@ PROXY_URL = os.getenv("PROXY_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 PRICE_CHANNEL_ID = int(os.getenv("PRICE_CHANNEL_ID"))
 
-# Инициализация сессии и бота
 session = AiohttpSession(proxy=PROXY_URL)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
@@ -58,20 +57,33 @@ async def update_all_resources():
     logging.info("Обновление ресурсов...")
     conn = sqlite3.connect("manager.db")
     cur = conn.cursor()
-    cur.execute("SELECT username, members FROM chats")
-    all_counts = {row[0]: row[1] for row in cur.fetchall()}
     
+    # Получаем данные всех чатов
+    cur.execute("SELECT username, members FROM chats")
+    rows = cur.fetchall()
+    all_counts = {row[0]: row[1] for row in rows}
+    
+    # Считаем общую сумму участников
+    total_members = sum(row[1] for row in rows)
+    
+    # Получаем все шаблоны постов
     cur.execute("SELECT msg_id, raw_text FROM templates")
     templates = cur.fetchall()
     
     for msg_id, text in templates:
         new_text = text
+        
+        # 1. Обновляем "Во всех чатах" (ищет фразу и число под ней)
+        total_pattern = rf"(Во всех чатах\n\s*)(\d+)"
+        new_text = re.sub(total_pattern, rf"\g<1>{total_members}", new_text)
+        
+        # 2. Обновляем конкретные чаты по списку @username
         for user, count in all_counts.items():
-            # Регулярка для поиска юзернейма и числа под ним
             pattern = rf"({re.escape(user)}\n\s*)(\d+)"
             new_text = re.sub(pattern, rf"\g<1>{count}", new_text)
         
         try:
+            # Редактируем, только если текст реально изменился
             await bot.edit_message_text(
                 chat_id=PRICE_CHANNEL_ID, 
                 message_id=msg_id, 
@@ -79,15 +91,18 @@ async def update_all_resources():
                 parse_mode="HTML"
             )
         except Exception as e:
-            logging.error(f"Ошибка правки канала (сообщение {msg_id}): {e}")
+            # Игнорируем ошибку, если текст остался прежним
+            if "message is not modified" not in str(e):
+                logging.error(f"Ошибка правки канала (сообщение {msg_id}): {e}")
 
-    # Обновление закрепов (если нужно)
+    # Обновление закрепов в чатах
     cur.execute("SELECT chat_id, pin_msg_id FROM chats WHERE pin_msg_id IS NOT NULL")
     pins = cur.fetchall()
     if pins:
         list_text = "✨ 🙂🙂🙂🙂   🙂🙂🙂 ✨\n\nВсе мои пиар-чаты:\n\n"
         for user in all_counts.keys():
             list_text += f"🤩 {user}\n"
+        list_text += f"\n📊 Всего участников: {total_members}"
         list_text += "\nМой личный ТГК: https://t.me/+ThoDBS7OMkEzMTYy"
         
         for c_id, p_id in pins:
@@ -116,6 +131,7 @@ async def add_chat_cmd(message: types.Message):
         conn.commit()
         conn.close()
         await message.answer(f"✅ Чат {username} добавлен. Участников: {count}")
+        await update_all_resources() # Сразу обновляем прайсы
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
 
@@ -132,12 +148,14 @@ async def set_template(message: types.Message):
     cur.execute("INSERT OR REPLACE INTO templates (msg_id, raw_text) VALUES (?, ?)", (msg_id, raw_text))
     conn.commit()
     conn.close()
-    await message.answer(f"✅ Шаблон для сообщения #{msg_id} сохранен.")
+    await message.answer(f"✅ Пост #{msg_id} сохранен как шаблон и будет обновляться.")
+    await update_all_resources()
 
 @dp.chat_member()
 async def member_update(event: types.ChatMemberUpdated):
     conn = sqlite3.connect("manager.db")
     cur = conn.cursor()
+    
     if event.new_chat_member.status in ["member", "administrator"]:
         cur.execute("UPDATE chats SET joined_today = joined_today + 1 WHERE chat_id = ?", (event.chat.id,))
     elif event.new_chat_member.status in ["left", "kicked"]:
@@ -147,6 +165,8 @@ async def member_update(event: types.ChatMemberUpdated):
     cur.execute("UPDATE chats SET members = ? WHERE chat_id = ?", (new_count, event.chat.id))
     conn.commit()
     conn.close()
+    
+    # Запускаем обновление
     await update_all_resources()
 
 async def send_daily_report():
@@ -157,8 +177,12 @@ async def send_daily_report():
     if not data: return
     
     report = f"📈 **Отчет за {datetime.now().strftime('%d.%m')}**\n\n"
+    total = 0
     for row in data:
         report += f"{row[0]}: {row[1]} (+{row[2]} | -{row[3]})\n"
+        total += row[1]
+    
+    report += f"\n**Итого во всех чатах: {total}**"
     
     cur.execute("UPDATE chats SET joined_today = 0, left_today = 0")
     conn.commit()
