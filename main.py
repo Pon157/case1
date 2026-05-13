@@ -27,6 +27,7 @@ PROXY_URL = os.getenv("PROXY_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 PRICE_CHANNEL_ID = int(os.getenv("PRICE_CHANNEL_ID"))
 
+# Инициализация сессии и бота
 session = AiohttpSession(proxy=PROXY_URL)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
@@ -34,8 +35,10 @@ scheduler = AsyncIOScheduler()
 
 # --- DATABASE ---
 def init_db():
-    conn = sqlite3.connect("manager.db")
+    conn = sqlite3.connect("manager.db", timeout=20)
     cur = conn.cursor()
+    # ВКЛЮЧАЕМ РЕЖИМ WAL ДЛЯ ИЗБЕЖАНИЯ БЛОКИРОВОК
+    cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("""CREATE TABLE IF NOT EXISTS chats (
         chat_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -50,68 +53,68 @@ def init_db():
     )""")
     conn.commit()
     conn.close()
-    logging.info("База данных инициализирована.")
+    logging.info("База данных инициализирована (WAL mode ON).")
 
 # --- LOGIC ---
 async def update_all_resources():
     logging.info("Обновление ресурсов...")
-    conn = sqlite3.connect("manager.db")
+    # Добавляем таймаут ожидания базы
+    conn = sqlite3.connect("manager.db", timeout=20)
     cur = conn.cursor()
     
-    # Получаем данные всех чатов
-    cur.execute("SELECT username, members FROM chats")
-    rows = cur.fetchall()
-    all_counts = {row[0]: row[1] for row in rows}
-    
-    # Считаем общую сумму участников
-    total_members = sum(row[1] for row in rows)
-    
-    # Получаем все шаблоны постов
-    cur.execute("SELECT msg_id, raw_text FROM templates")
-    templates = cur.fetchall()
-    
-    for msg_id, text in templates:
-        new_text = text
+    try:
+        # Получаем данные всех чатов
+        cur.execute("SELECT username, members FROM chats")
+        rows = cur.fetchall()
+        all_counts = {row[0]: row[1] for row in rows}
         
-        # 1. Обновляем "Во всех чатах" (ищет фразу и число под ней)
-        total_pattern = rf"(Во всех чатах\n\s*)(\d+)"
-        new_text = re.sub(total_pattern, rf"\g<1>{total_members}", new_text)
+        # Считаем общую сумму участников
+        total_members = sum(row[1] for row in rows)
         
-        # 2. Обновляем конкретные чаты по списку @username
-        for user, count in all_counts.items():
-            pattern = rf"({re.escape(user)}\n\s*)(\d+)"
-            new_text = re.sub(pattern, rf"\g<1>{count}", new_text)
+        # Получаем все шаблоны постов
+        cur.execute("SELECT msg_id, raw_text FROM templates")
+        templates = cur.fetchall()
         
-        try:
-            # Редактируем, только если текст реально изменился
-            await bot.edit_message_text(
-                chat_id=PRICE_CHANNEL_ID, 
-                message_id=msg_id, 
-                text=new_text, 
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            # Игнорируем ошибку, если текст остался прежним
-            if "message is not modified" not in str(e):
-                logging.error(f"Ошибка правки канала (сообщение {msg_id}): {e}")
-
-    # Обновление закрепов в чатах
-    cur.execute("SELECT chat_id, pin_msg_id FROM chats WHERE pin_msg_id IS NOT NULL")
-    pins = cur.fetchall()
-    if pins:
-        list_text = "✨ 🙂🙂🙂🙂   🙂🙂🙂 ✨\n\nВсе мои пиар-чаты:\n\n"
-        for user in all_counts.keys():
-            list_text += f"🤩 {user}\n"
-        list_text += f"\n📊 Всего участников: {total_members}"
-        list_text += "\nМой личный ТГК: https://t.me/+ThoDBS7OMkEzMTYy"
-        
-        for c_id, p_id in pins:
+        for msg_id, text in templates:
+            new_text = text
+            
+            # 1. Обновляем "Во всех чатах"
+            total_pattern = rf"(Во всех чатах\n\s*)(\d+)"
+            new_text = re.sub(total_pattern, rf"\g<1>{total_members}", new_text)
+            
+            # 2. Обновляем конкретные чаты по списку @username
+            for user, count in all_counts.items():
+                pattern = rf"({re.escape(user)}\n\s*)(\d+)"
+                new_text = re.sub(pattern, rf"\g<1>{count}", new_text)
+            
             try:
-                await bot.edit_message_text(chat_id=c_id, message_id=p_id, text=list_text)
-            except Exception:
-                pass
-    
-    conn.close()
+                await bot.edit_message_text(
+                    chat_id=PRICE_CHANNEL_ID, 
+                    message_id=msg_id, 
+                    text=new_text, 
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                if "message is not modified" not in str(e):
+                    logging.error(f"Ошибка правки канала (сообщение {msg_id}): {e}")
+
+        # Обновление закрепов в чатах
+        cur.execute("SELECT chat_id, pin_msg_id FROM chats WHERE pin_msg_id IS NOT NULL")
+        pins = cur.fetchall()
+        if pins:
+            list_text = "✨ 🙂🙂🙂🙂   🙂🙂🙂 ✨\n\nВсе мои пиар-чаты:\n\n"
+            for user in all_counts.keys():
+                list_text += f"🤩 {user}\n"
+            list_text += f"\n📊 Всего участников: {total_members}"
+            list_text += "\nМой личный ТГК: https://t.me/+ThoDBS7OMkEzMTYy"
+            
+            for c_id, p_id in pins:
+                try:
+                    await bot.edit_message_text(chat_id=c_id, message_id=p_id, text=list_text)
+                except Exception:
+                    pass
+    finally:
+        conn.close()
 
 # --- HANDLERS ---
 @dp.message(Command("add_chat"), F.from_user.id == ADMIN_ID)
@@ -124,14 +127,14 @@ async def add_chat_cmd(message: types.Message):
         chat = await bot.get_chat(username)
         count = await bot.get_chat_member_count(chat.id)
         
-        conn = sqlite3.connect("manager.db")
+        conn = sqlite3.connect("manager.db", timeout=20)
         cur = conn.cursor()
         cur.execute("INSERT OR REPLACE INTO chats (chat_id, username, members) VALUES (?, ?, ?)", 
                     (chat.id, username, count))
         conn.commit()
         conn.close()
         await message.answer(f"✅ Чат {username} добавлен. Участников: {count}")
-        await update_all_resources() # Сразу обновляем прайсы
+        await update_all_resources()
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
 
@@ -143,34 +146,40 @@ async def set_template(message: types.Message):
     msg_id = message.reply_to_message.forward_from_message_id
     raw_text = message.reply_to_message.html_text
     
-    conn = sqlite3.connect("manager.db")
+    conn = sqlite3.connect("manager.db", timeout=20)
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO templates (msg_id, raw_text) VALUES (?, ?)", (msg_id, raw_text))
     conn.commit()
     conn.close()
-    await message.answer(f"✅ Пост #{msg_id} сохранен как шаблон и будет обновляться.")
+    await message.answer(f"✅ Пост #{msg_id} сохранен как шаблон.")
     await update_all_resources()
 
 @dp.chat_member()
 async def member_update(event: types.ChatMemberUpdated):
-    conn = sqlite3.connect("manager.db")
+    # ПАУЗА 0.5 сек для разгрузки очереди при массовом входе
+    await asyncio.sleep(0.5)
+    
+    conn = sqlite3.connect("manager.db", timeout=20)
     cur = conn.cursor()
     
-    if event.new_chat_member.status in ["member", "administrator"]:
-        cur.execute("UPDATE chats SET joined_today = joined_today + 1 WHERE chat_id = ?", (event.chat.id,))
-    elif event.new_chat_member.status in ["left", "kicked"]:
-        cur.execute("UPDATE chats SET left_today = left_today + 1 WHERE chat_id = ?", (event.chat.id,))
+    try:
+        if event.new_chat_member.status in ["member", "administrator"]:
+            cur.execute("UPDATE chats SET joined_today = joined_today + 1 WHERE chat_id = ?", (event.chat.id,))
+        elif event.new_chat_member.status in ["left", "kicked"]:
+            cur.execute("UPDATE chats SET left_today = left_today + 1 WHERE chat_id = ?", (event.chat.id,))
+        
+        new_count = await bot.get_chat_member_count(event.chat.id)
+        cur.execute("UPDATE chats SET members = ? WHERE chat_id = ?", (new_count, event.chat.id))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка БД в member_update: {e}")
+    finally:
+        conn.close()
     
-    new_count = await bot.get_chat_member_count(event.chat.id)
-    cur.execute("UPDATE chats SET members = ? WHERE chat_id = ?", (new_count, event.chat.id))
-    conn.commit()
-    conn.close()
-    
-    # Запускаем обновление
     await update_all_resources()
 
 async def send_daily_report():
-    conn = sqlite3.connect("manager.db")
+    conn = sqlite3.connect("manager.db", timeout=20)
     cur = conn.cursor()
     cur.execute("SELECT username, members, joined_today, left_today FROM chats")
     data = cur.fetchall()
